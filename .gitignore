@@ -1,0 +1,45 @@
+# Ambiente virtual
+venv/
+env/
+.venv/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.egg-info/
+*.egg
+build/
+dist/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Dataset (vídeos/imagens podem ficar pesados e são dados sensíveis - não versionar)
+dataset/
+
+# Modelos treinados (arquivos binários grandes)
+*.pkl
+*.joblib
+*.h5
+*.pt
+*.onnx
+
+# Logs e outputs
+logs/
+*.log
+outputs/
+
+# Configurações locais / segredos
+.env
+*.local
+
+# Sistema operacional
+.DS_Store
+Thumbs.db
+
+# Editor
+.vscode/
+.idea/
+*.swp
