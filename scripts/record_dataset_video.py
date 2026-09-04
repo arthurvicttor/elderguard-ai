@@ -30,7 +30,7 @@ def record_clip(output_path, duration_seconds=6, fps=20):
                 break
             writer.write(frame)
             cv2.imshow("Gravando... (ESC para parar antes)", frame)
-            if cv2.waitKey(1) & 0xFF == 27:  # ESC
+            if cv2.waitKey(1) & 0xFF == 27: 
                 break
     finally:
         camera.release()
