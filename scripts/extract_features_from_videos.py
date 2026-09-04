@@ -20,7 +20,7 @@ def process_video(video_path, label, pose_estimator):
         print(f"  [AVISO] Não foi possível abrir: {video_path}")
         return []
 
-    feature_extractor = TemporalFeatureExtractor()  # estado novo por vídeo
+    feature_extractor = TemporalFeatureExtractor() 
     rows = []
     frame_idx = 0
 
