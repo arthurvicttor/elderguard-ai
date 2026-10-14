@@ -18,6 +18,7 @@ dist/
 
 # Dataset (vídeos/imagens podem ficar pesados e são dados sensíveis - não versionar)
 dataset/
+dataset_raw/
 
 # Modelos treinados (arquivos binários grandes)
 *.pkl
