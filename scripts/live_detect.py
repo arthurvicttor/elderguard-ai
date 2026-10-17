@@ -63,16 +63,17 @@ def clean_buffer(buffer):
 
 
 def score_window(cleaned, model, cols):
-    """Score do modelo para a janela atual. Retorna None se a janela não for válida."""
+    """Retorna (score, features) da janela atual, ou (None, None) se a janela não for válida."""
     with warnings.catch_warnings():
         warnings.simplefilter("ignore", RuntimeWarning)
         w = cleaned.iloc[-mw.WIN:]
         if len(w) < mw.WIN or w["valid"].mean() < mw.MIN_VALID_FRAC or w["valid"].iloc[-1] != 1:
-            return None
+            return None, None
         feats = mw.window_features(w)
     if feats is None or not np.all(np.isfinite(list(feats.values()))):
-        return None
-    return float(model.predict_proba(pd.DataFrame([feats])[cols])[0, 1])
+        return None, None
+    score = float(model.predict_proba(pd.DataFrame([feats])[cols])[0, 1])
+    return score, feats
 
 
 def posture_state(cleaned):
@@ -114,7 +115,7 @@ def main():
     monitor = RiskMonitor(immobile_s=args.immobile_s)
 
     idx, fps, last_t, pose_ms = 0, None, None, 0.0
-    score, last_alert_t, alert_text, alert_until = None, -1e9, None, 0.0
+    score, feats, last_alert_t, alert_text, alert_until = None, -1e9, None, 0.0
     risk = {"score": 0, "level": Level.LOW, "reasons": [], "active": False, "resolved": False}
     last_level = Level.LOW
     print(f"Iniciado. Limiar = {thr:.3f}. 'q' sai, 'r' reinicia o episodio de risco.")
@@ -152,7 +153,7 @@ def main():
                 if fps:
                     cf.FPS = fps           # velocidades em unidades reais
                 cleaned = clean_buffer(buffer)
-                score = score_window(cleaned, model, cols)
+                score, feats= score_window(cleaned, model, cols)
 
                 t = time.time()
                 fall_alert = False
@@ -185,6 +186,10 @@ def main():
                 if fps < 20:
                     put(frame, "FPS baixo: resultados menos confiaveis", 85, (0, 0, 255))
             put(frame, f"pose: {pose_ms:.0f} ms/frame", 110)
+
+            if feats:
+                put(frame, f"hip_drop {feats['hip_drop']:.2f} | angle_rise {feats['angle_rise']:.0f} | absvy {feats['absvy_mean']:.2f}",
+                    frame.shape[0] - 8, (255, 255, 0), 0.4)
 
             put(frame, f"RISCO: {risk['level'].value.upper()} ({risk['score']})",
                 140, LEVEL_COLOR[risk["level"]], 0.7)
