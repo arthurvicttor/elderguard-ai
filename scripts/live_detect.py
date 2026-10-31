@@ -2,6 +2,7 @@ import sys
 import os
 import time
 import argparse
+import traceback
 import warnings
 from collections import deque
 from datetime import datetime
@@ -12,6 +13,11 @@ import cv2
 import joblib
 import numpy as np
 import pandas as pd
+
+try:
+    import psutil          # opcional: mede CPU e memória nos batimentos
+except ImportError:
+    psutil = None
 
 from src.camera import Camera
 from src.pose import PoseEstimator
@@ -26,6 +32,8 @@ EVAL_EVERY = mw.STRIDE        # avalia a cada 5 frames, como no treino
 ALERT_SHOW_S = 8              # quanto tempo o alerta de queda fica na tela
 COOLDOWN_S = 10               # intervalo mínimo entre dois alertas do modelo
 HEARTBEAT_S = 60              # um registro de funcionamento por minuto
+GAP_S = 5.0                   # mais que isso entre dois frames = lacuna (ex: PC suspenso)
+RECONNECT_WAIT_S = 2.0        # espera entre tentativas de reabrir a câmera
 
 # Postura/imobilidade (valores INICIAIS, a calibrar nos testes)
 STILL_FRAMES = 25             # ~1 s de frames recentes
@@ -39,6 +47,7 @@ ROW_COLS = ["scene", "video_file", "frame_idx", "frame_number",
             "phase", "is_fall", "pose_ok"] + LM_COLS
 LEVEL_COLOR = {Level.LOW: (0, 255, 0), Level.ATTENTION: (0, 255, 255),
                Level.ALERT: (0, 165, 255), Level.EMERGENCY: (0, 0, 255)}
+RISK_IDLE = {"score": 0, "level": Level.LOW, "reasons": [], "active": False, "resolved": False}
 
 
 def make_row(idx, lms):
@@ -104,6 +113,12 @@ def main():
                         help="Segundos parado no chão para subir o risco (10 = valor de teste)")
     parser.add_argument("--log-dir", default="logs", help="Pasta do log local de eventos")
     parser.add_argument("--no-log", action="store_true", help="Não registra eventos")
+    parser.add_argument("--headless", action="store_true",
+                        help="Sem janela nem desenho (Ctrl+C para parar)")
+    parser.add_argument("--max-minutes", type=float, default=0,
+                        help="Se > 0, encerra sozinho depois desse tempo (útil para testes)")
+    parser.add_argument("--camera-timeout-s", type=float, default=300,
+                        help="Encerra (código 2) se a câmera ficar sem sinal por esse tempo")
     args = parser.parse_args()
 
     if not hasattr(cf, "ASPECT"):
@@ -111,6 +126,10 @@ def main():
 
     saved = joblib.load(args.model)
     model, cols, thr = saved["model"], saved["cols"], saved["threshold"]
+
+    proc = psutil.Process() if psutil else None
+    if proc:
+        proc.cpu_percent(None)     # a primeira chamada só inicia a medição
 
     camera = Camera(source=args.source).open()
     pose = PoseEstimator()
@@ -120,33 +139,82 @@ def main():
 
     idx, fps, last_t, pose_ms = 0, None, None, 0.0
     score, feats, last_alert_t, alert_text, alert_until = None, None, -1e9, None, 0.0
-    risk = {"score": 0, "level": Level.LOW, "reasons": [], "active": False, "resolved": False}
+    risk = dict(RISK_IDLE)
     last_level = Level.LOW
-    last_hb = time.time()
+    t_start = time.time()
+    last_hb = t_start
+    last_wall = None
+    need_aspect = True
+    cam_lost_at = None
+    reason, exit_code = "user_quit", 0
 
     log.log("session_start", threshold=round(thr, 3), immobile_s=args.immobile_s,
-            width=args.width, source=args.source)
-    print(f"Iniciado. Limiar = {thr:.3f}. 'q' sai, 'r' reinicia o episodio de risco.")
+            width=args.width, source=args.source, headless=args.headless)
+    stop_hint = "Ctrl+C para parar" if args.headless else "'q' sai, 'r' reinicia o episodio de risco"
+    print(f"Iniciado. Limiar = {thr:.3f}. {stop_hint}.")
     if not args.no_log:
         print(f"Log local em '{args.log_dir}' (só números, nenhum vídeo é salvo).")
+    if not proc:
+        print("(psutil não instalado: CPU e memória não serão registradas)")
 
     try:
         while True:
+            if args.max_minutes > 0 and time.time() - t_start > args.max_minutes * 60:
+                reason = "max_minutes"
+                break
+
             frame = camera.read_frame()
             if frame is None:
-                print("Falha ao ler frame da câmera.")
-                log.log("camera_error")
-                break
+                if cam_lost_at is None:
+                    cam_lost_at = time.time()
+                    log.log("camera_lost")
+                    print("[CAMERA] sem frames; tentando reconectar...")
+                    buffer.clear()
+                    last_t, last_wall, fps = None, None, None
+                if time.time() - cam_lost_at > args.camera_timeout_s:
+                    print("[CAMERA] sem sinal por tempo demais; encerrando.")
+                    reason, exit_code = "camera_unrecoverable", 2
+                    break
+                camera.release()
+                time.sleep(RECONNECT_WAIT_S)
+                try:
+                    camera.open()
+                except RuntimeError:
+                    pass
+                continue
+
+            if cam_lost_at is not None:
+                down = time.time() - cam_lost_at
+                log.log("camera_recovered", seconds=round(down, 1))
+                print(f"[CAMERA] recuperada após {down:.0f}s")
+                cam_lost_at = None
+                need_aspect = True
 
             if args.width > 0 and frame.shape[1] > args.width:
                 s = args.width / frame.shape[1]
                 frame = cv2.resize(frame, None, fx=s, fy=s)
 
-            if idx == 0:
+            if need_aspect:
                 h, w = frame.shape[:2]
                 cf.ASPECT = w / h          # proporção real desta câmera
                 print(f"Resolução {w}x{h}")
                 log.log("camera_info", width=w, height=h)
+                need_aspect = False
+
+            wall = time.time()
+            if last_wall is not None and wall - last_wall > GAP_S:
+                gap = wall - last_wall
+                log.log("time_gap", seconds=round(gap, 1))
+                print(f"[TEMPO] lacuna de {gap:.0f}s (PC suspenso?); janela e episódio reiniciados")
+                buffer.clear()
+                monitor.reset()
+                if last_level != Level.LOW:
+                    log.log("risk_change", from_level=last_level.value,
+                            to_level=Level.LOW.value, risk_score=0,
+                            reasons=["reiniciado: lacuna de tempo"])
+                risk, last_level = dict(RISK_IDLE), Level.LOW
+                last_t = None
+            last_wall = wall
 
             now = time.perf_counter()
             if last_t is not None:
@@ -158,15 +226,21 @@ def main():
             result = pose.process(frame)
             pose_ms = 0.95 * pose_ms + 0.05 * (time.perf_counter() - t0) * 1000
             lms = result.pose_landmarks[0] if result.pose_landmarks else None
-            frame = pose.draw_landmarks(frame, result)
+            if not args.headless:
+                frame = pose.draw_landmarks(frame, result)
             buffer.append(make_row(idx, lms))
 
-            t_now = time.time()
-            if fps and t_now - last_hb >= HEARTBEAT_S:
-                last_hb = t_now
+            if fps and wall - last_hb >= HEARTBEAT_S:
+                last_hb = wall
                 visible = sum(r["pose_ok"] for r in buffer) / max(len(buffer), 1)
-                log.log("heartbeat", fps=round(fps, 1), pose_ms=round(pose_ms),
-                        person_visible=round(visible, 2))
+                hb = dict(fps=round(fps, 1), pose_ms=round(pose_ms),
+                          person_visible=round(visible, 2))
+                if proc:
+                    hb["cpu_pct"] = round(proc.cpu_percent(None), 1)
+                    hb["rss_mb"] = round(proc.memory_info().rss / 1e6)
+                log.log("heartbeat", **hb)
+                print(f"[{datetime.now():%H:%M:%S}] fps {fps:.1f} | pessoa visível {visible:.0%} "
+                      f"| risco {risk['level'].value}")
 
             if len(buffer) >= mw.WIN and idx % EVAL_EVERY == 0:
                 if fps:
@@ -196,52 +270,61 @@ def main():
                             reasons=risk["reasons"])
                     last_level = risk["level"]
 
-            if len(buffer) < mw.WIN:
-                put(frame, "aquecendo...", 60)
-            elif score is None:
-                put(frame, "aguardando janela valida (pessoa visivel?)", 60)
-            else:
-                put(frame, f"score: {score:.2f}  (limiar {thr:.2f})", 60)
+            if not args.headless:
+                if len(buffer) < mw.WIN:
+                    put(frame, "aquecendo...", 60)
+                elif score is None:
+                    put(frame, "aguardando janela valida (pessoa visivel?)", 60)
+                else:
+                    put(frame, f"score: {score:.2f}  (limiar {thr:.2f})", 60)
 
-            if fps:
-                color = (0, 255, 0) if fps >= 20 else (0, 0, 255)
-                put(frame, f"FPS: {fps:.1f}", 30, color, 0.8)
-                if fps < 20:
-                    put(frame, "FPS baixo: resultados menos confiaveis", 85, (0, 0, 255))
-            put(frame, f"pose: {pose_ms:.0f} ms/frame", 110)
+                if fps:
+                    color = (0, 255, 0) if fps >= 20 else (0, 0, 255)
+                    put(frame, f"FPS: {fps:.1f}", 30, color, 0.8)
+                    if fps < 20:
+                        put(frame, "FPS baixo: resultados menos confiaveis", 85, (0, 0, 255))
+                put(frame, f"pose: {pose_ms:.0f} ms/frame", 110)
 
-            put(frame, f"RISCO: {risk['level'].value.upper()} ({risk['score']})",
-                140, LEVEL_COLOR[risk["level"]], 0.7)
-            if risk["active"]:
-                put(frame, " / ".join(risk["reasons"]), 165, LEVEL_COLOR[risk["level"]])
-                if risk["level"] == Level.EMERGENCY:
-                    put(frame, "VERIFIQUE A PESSOA", 195, (0, 0, 255), 0.8)
+                put(frame, f"RISCO: {risk['level'].value.upper()} ({risk['score']})",
+                    140, LEVEL_COLOR[risk["level"]], 0.7)
+                if risk["active"]:
+                    put(frame, " / ".join(risk["reasons"]), 165, LEVEL_COLOR[risk["level"]])
+                    if risk["level"] == Level.EMERGENCY:
+                        put(frame, "VERIFIQUE A PESSOA", 195, (0, 0, 255), 0.8)
 
-            if feats:
-                put(frame, f"hip_drop {feats['hip_drop']:.2f} | angle_rise {feats['angle_rise']:.0f} "
-                           f"| absvy {feats['absvy_mean']:.2f}",
-                    frame.shape[0] - 8, (255, 255, 0), 0.4)
+                if feats:
+                    put(frame, f"hip_drop {feats['hip_drop']:.2f} | angle_rise {feats['angle_rise']:.0f} "
+                               f"| absvy {feats['absvy_mean']:.2f}",
+                        frame.shape[0] - 8, (255, 255, 0), 0.4)
 
-            if alert_text and time.time() < alert_until:
-                put(frame, alert_text, frame.shape[0] - 30, (0, 0, 255), 0.7)
+                if alert_text and time.time() < alert_until:
+                    put(frame, alert_text, frame.shape[0] - 30, (0, 0, 255), 0.7)
 
-            cv2.imshow("ElderGuard AI - Etapa 13 (ao vivo)", frame)
-            key = cv2.waitKey(1) & 0xFF
-            if key == ord("q"):
-                break
-            if key == ord("r"):
-                monitor.reset()
-                risk = {"score": 0, "level": Level.LOW, "reasons": [], "active": False, "resolved": False}
-                last_level = Level.LOW
-                log.log("manual_reset")
-                print("[RISCO] episodio reiniciado manualmente")
+                cv2.imshow("ElderGuard AI - Etapa 14 (ao vivo)", frame)
+                key = cv2.waitKey(1) & 0xFF
+                if key == ord("q"):
+                    break
+                if key == ord("r"):
+                    monitor.reset()
+                    risk, last_level = dict(RISK_IDLE), Level.LOW
+                    log.log("manual_reset")
+                    print("[RISCO] episodio reiniciado manualmente")
             idx += 1
+
+    except KeyboardInterrupt:
+        reason = "interrupted"
+        print("\nInterrompido pelo usuário.")
+    except Exception as e:
+        reason, exit_code = "crash", 1
+        log.log("crash", error=f"{type(e).__name__}: {e}")
+        traceback.print_exc()
     finally:
-        log.log("session_end", frames=idx)
+        log.log("session_end", frames=idx, reason=reason)
         camera.release()
         pose.close()
         cv2.destroyAllWindows()
         print("Encerrado.")
+    sys.exit(exit_code)
 
 
 if __name__ == "__main__":
