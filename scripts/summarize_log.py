@@ -18,8 +18,12 @@ def main():
     s = summarize(events, load_reviews(args.log_dir))
     h = s["hours"]
 
-    print(f"Sessões: {s['sessions']}  (sem fim registrado: {s['unclosed_sessions']})")
-    print(f"Tempo ligado: {h:.2f} h  (inclui períodos sem ninguém no quadro)")
+    print(f"Sessões: {s['sessions']}  (sem fim registrado: {s['unclosed_sessions']}, "
+          f"quedas do programa: {s['crashes']})")
+    print(f"Tempo ligado e vendo: {h:.2f} h  (inclui períodos sem ninguém no quadro)")
+    print(f"Tempo perdido: {s['lost_s'] / 60:.1f} min  "
+          f"({s['time_gaps']} lacunas de tempo, {s['camera_losses']} perdas de câmera)")
+
     print(f"\nAlertas de queda do modelo: {s['fall_alerts']}")
     print(f"  revisados como queda real/simulada: {s['real']}")
     print(f"  revisados como falso alarme:        {s['false']}")
@@ -37,6 +41,11 @@ def main():
               f"{s['low_fps_frac']:.0%} dos batimentos abaixo de 20")
     if s["visible_median"] is not None:
         print(f"Fração do tempo com pessoa visível (mediana): {s['visible_median']:.0%}")
+    if s["cpu_median"] is not None:
+        print(f"CPU do processo (mediana, % de um núcleo): {s['cpu_median']:.0f}")
+    if s["mem_first_mb"] is not None:
+        print(f"Memória na sessão mais longa: {s['mem_first_mb']:.0f} MB -> "
+              f"{s['mem_last_mb']:.0f} MB ({s['mem_beats']} medidas)")
 
 
 if __name__ == "__main__":
