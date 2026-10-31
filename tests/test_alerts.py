@@ -60,6 +60,17 @@ def test_sessao_sem_fim_usa_ultimo_evento():
     s = summarize(events)
     assert abs(s["hours"] - 0.5) < 1e-6 and s["unclosed_sessions"] == 1
 
+def test_resumo_desconta_tempo_perdido():
+    events = [
+        ev("c1", "2026-10-30T10:00:00", "session_start", session="s3"),
+        ev("c2", "2026-10-30T10:20:00", "time_gap", session="s3", seconds=600.0),
+        ev("c3", "2026-10-30T10:40:00", "camera_recovered", session="s3", seconds=300.0),
+        ev("c4", "2026-10-30T11:00:00", "session_end", session="s3"),
+    ]
+    s = summarize(events)
+    # 3600 s de intervalo - 900 s perdidos = 2700 s = 0.75 h
+    assert abs(s["hours"] - 0.75) < 1e-6 and abs(s["lost_s"] - 900.0) < 1e-6
+
 
 if __name__ == "__main__":
     for name, fn in list(globals().items()):
