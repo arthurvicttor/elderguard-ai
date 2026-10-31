@@ -82,7 +82,8 @@ def summarize(events, reviews=None):
     for e in events:
         by_session.setdefault(e["session"], []).append(e)
 
-    total_s, unclosed = 0.0, 0
+    total_s, unclosed, lost_s = 0.0, 0, 0.0
+    best_mem = []
     for evs in by_session.values():
         evs = sorted(evs, key=lambda e: e["ts"])
         start_ev = next((e for e in evs if e["type"] == "session_start"), evs[0])
@@ -92,7 +93,16 @@ def summarize(events, reviews=None):
             end_ev = evs[-1]          # sem fim: usa o último evento registrado
         start = datetime.fromisoformat(start_ev["ts"])
         end = datetime.fromisoformat(end_ev["ts"])
-        total_s += max((end - start).total_seconds(), 0.0)
+        span = max((end - start).total_seconds(), 0.0)
+        # tempo em que o sistema não estava vendo nada (PC suspenso, câmera caída)
+        down = min(sum(e.get("seconds", 0.0) for e in evs
+                       if e["type"] in ("time_gap", "camera_recovered")), span)
+        lost_s += down
+        total_s += span - down
+
+        mem = [e["rss_mb"] for e in evs if e["type"] == "heartbeat" and "rss_mb" in e]
+        if len(mem) > len(best_mem):
+            best_mem = mem            # sessão mais longa com medida de memória
     hours = total_s / 3600.0
 
     alerts = [e for e in events if e["type"] == "fall_alert"]
@@ -102,14 +112,19 @@ def summarize(events, reviews=None):
     unreviewed = len(alerts) - real - false
 
     changes = [e for e in events if e["type"] == "risk_change"]
-    fps = [e["fps"] for e in events if e["type"] == "heartbeat" and "fps" in e]
-    vis = [e["person_visible"] for e in events
-           if e["type"] == "heartbeat" and "person_visible" in e]
+    beats = [e for e in events if e["type"] == "heartbeat"]
+    fps = [e["fps"] for e in beats if "fps" in e]
+    vis = [e["person_visible"] for e in beats if "person_visible" in e]
+    cpu = [e["cpu_pct"] for e in beats if "cpu_pct" in e]
 
     return {
         "sessions": len(by_session),
         "unclosed_sessions": unclosed,
         "hours": hours,
+        "lost_s": lost_s,
+        "camera_losses": sum(1 for e in events if e["type"] == "camera_lost"),
+        "time_gaps": sum(1 for e in events if e["type"] == "time_gap"),
+        "crashes": sum(1 for e in events if e["type"] == "crash"),
         "fall_alerts": len(alerts),
         "real": real, "false": false, "unreviewed": unreviewed,
         "emergencies": sum(1 for c in changes if c.get("to_level") == "emergencia"),
@@ -118,4 +133,8 @@ def summarize(events, reviews=None):
         "fps_min": min(fps) if fps else None,
         "low_fps_frac": (sum(1 for x in fps if x < 20) / len(fps)) if fps else None,
         "visible_median": statistics.median(vis) if vis else None,
+        "cpu_median": statistics.median(cpu) if cpu else None,
+        "mem_first_mb": best_mem[0] if len(best_mem) >= 2 else None,
+        "mem_last_mb": best_mem[-1] if len(best_mem) >= 2 else None,
+        "mem_beats": len(best_mem),
     }
