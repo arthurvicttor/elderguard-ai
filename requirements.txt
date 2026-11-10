@@ -2,5 +2,6 @@ opencv-python
 mediapipe
 numpy
 pandas
-kaggle
 scikit-learn
+joblib
+psutil
